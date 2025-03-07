@@ -4,7 +4,7 @@ author: charles.kan
 description: A specialized pipe that combines DeepSeek Reasoner's Chain-of-Thought capabilities with Claude's response generation. It first sends the prompt to DeepSeek API to generate reasoning wrapped in tags, then passes both the original prompt and DeepSeek's reasoning to Claude to produce the final response. This creates an enhanced experience where Claude appears to "think" before answering.
 version: 2.1.0
 licence: MIT
-github: 
+github: https://github.com/charleskan/open-webui-pipelines-deep-claude-2
 """
 
 import json
