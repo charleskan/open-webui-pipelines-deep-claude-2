@@ -41,7 +41,7 @@ async def claude_api_call(
         try:
             async with client.stream(
                 "POST",
-                f"{api_base_url}/v1/messages",
+                f"{api_base_url}/messages",
                 json=payload,
                 headers=headers,
                 timeout=300,
@@ -106,6 +106,7 @@ async def deepseek_api_call(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+
     async with httpx.AsyncClient(http2=True) as client:
         async with client.stream(
             "POST",
@@ -134,27 +135,27 @@ async def deepseek_api_call(
 class Pipe:
     class Valves(BaseModel):
         DEEPSEEK_API_BASE_URL: str = Field(
-            default="https://api.deepseek.com/v1",
-            description="DeepSeek API的基础请求地址",
+            default="https://openrouter.ai/api/v1",
+            description="DeepSeek API provider base URL",
         )
         DEEPSEEK_API_KEY: str = Field(
-            default="", description="用于身份验证的DeepSeek API密钥，可从控制台获取"
+            default="", description="DeepSeek API provider key"
         )
         DEEPSEEK_API_MODEL: str = Field(
-            default="deepseek-reasoner",
+            default="deepseek/deepseek-r1",
             description="default deepseek-reasoner ",
         )
         ANTHROPIC_API_KEY: str = Field(
             default="",
-            description="Claude API 密钥",
+            description="Claude API provider key",
             json_schema_extra={"format": "password"},
         )
         ANTHROPIC_API_BASE: str = Field(
-            default="https://api.anthropic.com", description="Claude API 基础地址"
+            default="https://api.anthropic.com", description="Claude API provider base URL"
         )
         ANTHROPIC_API_MODEL: str = Field(
-            default="claude-3-7-sonnet-latest",
-            description="default claude-3-7-sonnet-latest ",
+            default="claude-3-5-sonnet-latest",
+            description="default claude-3-5-sonnet-latest ",
         )
 
     def __init__(self):
@@ -172,26 +173,9 @@ class Pipe:
         """
         通用內容發送器 (類方法版本)
         """
-        if is_think_tag:
-            # 處理完整 think 標籤
-            yield f"<{content}>"
-            await asyncio.sleep(0.1)
-            yield "\n"
-        else:
-            # 常規內容處理
-            while content:
-                # 匹配開頭或結尾的 think 標籤
-                think_match = re.match(r"^</?(think)>", content)
-                if think_match:
-                    full_tag = think_match.group(0)  # 完整匹配的標籤
-                    yield full_tag
-                    await asyncio.sleep(0.1)
-                    yield "\n"
-                    content = content[len(full_tag) :]
-                else:
-                    # 發送非標籤內容
-                    yield content[0]
-                    content = content[1:]
+        while content:
+            yield content[0]
+            content = content[1:]
 
     async def pipe(
         self, body: dict, __event_emitter__: Callable[[dict], Awaitable[None]] = None
@@ -237,21 +221,18 @@ class Pipe:
             delta = choice.get("delta", {})  # 先获取delta
 
             # 现在可以安全访问delta
-            if reasoning := delta.get("reasoning_content"):
+            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning:
+                if self.thinking == -1:
+                    self.thinking = 0
+                    async for chunk in self._emit("<think>", is_think_tag=True):
+                        yield chunk
+                async for chunk in self._emit(reasoning):
+                    yield chunk
                 deepseek_response += reasoning
 
-            # 状态机处理（保持原有逻辑）
-            if self.thinking == -1 and delta.get("reasoning_content"):
-                self.thinking = 0
-                async for chunk in self._emit("think", is_think_tag=True):
-                    yield chunk
-            elif self.thinking == 0 and delta.get("content"):
-                self.thinking = 1
-                async for chunk in self._emit("/think", is_think_tag=True):
-                    yield chunk
-
             # 内容流式处理
-            if content := delta.get("reasoning_content", ""):
+            if content := delta.get("reasoning_content") or delta.get("reasoning"):
                 async for chunk in self._emit(content):
                     yield chunk
 
@@ -267,10 +248,11 @@ class Pipe:
             "model": self.valves.ANTHROPIC_API_MODEL,
             "messages": claude_messages,
             "stream": True,
+            "max_tokens": 8192,
             **{k: v for k, v in body.items() if k not in ["model", "messages"]},
         }
 
-        async for chunk in self._emit("\n[WAITING CLAUDE]\n"):
+        async for chunk in self._emit("</think>\n[WAITING CLAUDE]\n"):
             yield chunk
 
         # 第三阶段：处理Claude响应
