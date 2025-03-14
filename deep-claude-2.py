@@ -28,9 +28,6 @@ def format_error(status_code, error) -> str:
 async def claude_api_call(
     payload: dict, api_base_url: str, api_key: str
 ) -> AsyncGenerator[dict, None]:
-    """
-    Claude API 流式调用核心函数
-    """
     headers = {
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
@@ -59,7 +56,6 @@ async def claude_api_call(
                         data = json.loads(line[6:])
                         event_type = data.get("type")
 
-                        # 事件类型映射到统一格式
                         if event_type == "content_block_start":
                             yield {
                                 "choices": [
@@ -88,7 +84,7 @@ async def claude_api_call(
                                     }
 
                     except (json.JSONDecodeError, KeyError) as e:
-                        error_detail = f"解析失败 - 内容：{line}，原因：{e}"
+                        error_detail = f"ERROR - Content：{line}，Reason：{e}"
                         yield {"error": format_error("DataParseError", error_detail)}
                         return
 
@@ -99,9 +95,6 @@ async def claude_api_call(
 async def deepseek_api_call(
     payload: dict, api_base_url: str, api_key: str
 ) -> AsyncGenerator[dict, None]:
-    """
-    发送 DeepSeek API 请求，并以流式返回 JSON 数据。
-    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -126,7 +119,7 @@ async def deepseek_api_call(
                 try:
                     data = json.loads(json_str)
                 except json.JSONDecodeError as e:
-                    error_detail = f"解析失败 - 内容：{json_str}，原因：{e}"
+                    error_detail = f"ERROR - Content：{json_str}，Reason：{e}"
                     yield {"error": format_error("JSONDecodeError", error_detail)}
                     return
                 yield data
@@ -150,115 +143,89 @@ class Pipe:
             description="Claude API provider key",
             json_schema_extra={"format": "password"},
         )
-        ANTHROPIC_API_BASE: str = Field(
-            default="https://api.anthropic.com", description="Claude API provider base URL"
+        ANTHROPIC_API_BASE_URL: str = Field(
+            default="https://api.anthropic.com/v1",
+            description="Claude API provider base URL",
         )
         ANTHROPIC_API_MODEL: str = Field(
             default="claude-3-5-sonnet-latest",
             description="default claude-3-5-sonnet-latest ",
         )
+        ANTHROPIC_API_MAX_TOKENS: int = Field(
+            default=8192,
+            description="max tokens for claude response",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
         self.data_prefix = DATA_PREFIX
-        self.thinking = -1  # -1:未开始 0:思考中 1:已回答
         self.emitter = None
 
     def pipes(self):
         return [{"id": "DeepClaude", "name": "DeepClaude"}]
 
-    async def _emit(
-        self, content: str, is_think_tag: bool = False
-    ) -> AsyncGenerator[str, None]:
-        """
-        通用內容發送器 (類方法版本)
-        """
+    async def _emit(self, content: str) -> AsyncGenerator[str, None]:
         while content:
             yield content[0]
             content = content[1:]
 
     async def pipe(
-        self, body: dict, __event_emitter__: Callable[[dict], Awaitable[None]] = None
+        self,
+        body: dict,
+        __event_emitter__: Callable[[dict], Awaitable[None]] = None,
     ) -> AsyncGenerator[str, None]:
-        """
-        使用函数式实现的 DeepSeek API 调用，结合 Pipe 类中的业务逻辑处理。
-        """
-        self.thinking = -1
         self.emitter = __event_emitter__
 
         if not self.valves.DEEPSEEK_API_KEY:
-            yield json.dumps({"error": "未配置API密钥"}, ensure_ascii=False)
+            yield json.dumps({"error": "Missing api key"}, ensure_ascii=False)
             return
 
-        # 模型ID提取及 payload 预处理
         deepseek_model_id = self.valves.DEEPSEEK_API_MODEL
 
         deepseek_response = ""
         deepseek_payload = {**body, "model": deepseek_model_id}
 
-        deepseek_api_base_url = self.valves.DEEPSEEK_API_BASE_URL
-        deepseek_api_key = self.valves.DEEPSEEK_API_KEY
-
-        claude_model_id = self.valves.ANTHROPIC_API_MODEL
-        claude_api_base_url = self.valves.ANTHROPIC_API_BASE
-        claude_api_key = self.valves.ANTHROPIC_API_KEY
-
-        async for chunk in self._emit("[WAITING DEEPSEEK]\n"):
+        async for chunk in self._emit("<think>"):
             yield chunk
 
         async for data in deepseek_api_call(
             payload=deepseek_payload,
-            api_base_url=deepseek_api_base_url,
-            api_key=deepseek_api_key,
+            api_base_url=self.valves.DEEPSEEK_API_BASE_URL,
+            api_key=self.valves.DEEPSEEK_API_KEY,
         ):
             if "error" in data:
                 async for chunk in self._emit(data["error"]):
                     yield chunk
                 return
 
-            # 先解析数据再操作
             choice = data.get("choices", [{}])[0]
-            delta = choice.get("delta", {})  # 先获取delta
+            delta = choice.get("delta", {})
 
-            # 现在可以安全访问delta
-            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-            if reasoning:
-                if self.thinking == -1:
-                    self.thinking = 0
-                    async for chunk in self._emit("<think>", is_think_tag=True):
-                        yield chunk
-                async for chunk in self._emit(reasoning):
-                    yield chunk
-                deepseek_response += reasoning
-
-            # 内容流式处理
             if content := delta.get("reasoning_content") or delta.get("reasoning"):
                 async for chunk in self._emit(content):
                     yield chunk
 
             if choice.get("finish_reason"):
-                break  # 结束DeepSeek处理
+                break
 
-        # 构建增强后的消息历史
         claude_messages = body.get("messages", []) + [
             {"role": "assistant", "content": deepseek_response}
         ]
 
         claude_payload = {
-            "model": self.valves.ANTHROPIC_API_MODEL,
+            "model": "claude-3-5-sonnet-20240620",
             "messages": claude_messages,
-            "stream": True,
-            "max_tokens": 8192,
+            # "stream": True,
+            "max_tokens": self.valves.ANTHROPIC_API_MAX_TOKENS,
             **{k: v for k, v in body.items() if k not in ["model", "messages"]},
         }
 
-        async for chunk in self._emit("</think>\n[WAITING CLAUDE]\n"):
+        async for chunk in self._emit("</think>"):
             yield chunk
 
-        # 第三阶段：处理Claude响应
         async for claude_data in claude_api_call(
             payload=claude_payload,
-            api_base_url=self.valves.ANTHROPIC_API_BASE,
+            api_base_url=self.valves.ANTHROPIC_API_BASE_URL,
             api_key=self.valves.ANTHROPIC_API_KEY,
         ):
             if "error" in claude_data:
@@ -266,7 +233,6 @@ class Pipe:
                     yield chunk
                 return
 
-            # 解析Claude响应结构
             for choice in claude_data.get("choices", []):
                 delta = choice.get("delta", {})
                 if content := delta.get("content", ""):
